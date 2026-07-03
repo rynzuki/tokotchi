@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
@@ -193,7 +193,9 @@ fn run_ui() -> io::Result<bool> {
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(k) => {
+                // Only act on key *press* — Windows Console also emits Repeat/Release events
+                // for a single keystroke, which would otherwise fire each action 2-3×.
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
                     if handle_key(k.code, &mut mode, &shared, &mut toast, &mut happy_until) {
                         return Ok(false); // quit
                     }
