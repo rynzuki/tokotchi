@@ -1,0 +1,24 @@
+[package]
+name = "tokotchi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A collectible terminal pet that levels off your Claude Code token usage."
+repository = "https://github.com/rynzuki/tokotchi"
+
+[[bin]]
+name = "tokotchi"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+fastrand = "2"
+
+[profile.release]
+opt-level = "z"     # small + fast-to-spawn: `level` runs on every statusline render
+lto = true
+strip = true
+codegen-units = 1
