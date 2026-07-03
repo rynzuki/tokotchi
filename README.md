@@ -4,10 +4,10 @@ A collectible terminal pet that levels up off the tokens you spend on [Claude Co
 
 ```
         ╭─────── ❋ TOKOTCHI ❋ ───────╮
-        │                            │
+        │        ·        ✦          │
         │           /\_/\            │
-        │          ( o.o )           │
-        │           > ^ <            │
+        │      ✧   ( o.o )           │
+        │           > ^ <     ⋆      │
         │          /|   |\           │
         │           |___|            │
         │                            │
@@ -16,10 +16,15 @@ A collectible terminal pet that levels up off the tokens you spend on [Claude Co
         │                            │
         │    ━━━━━━━━━━━━━━━━━━━     │
         │    5.4M / 97.0M → Lv 49    │
+        │    Next: Beast at Lv 60    │
         │                            │
         │          Σ 2.31B           │
-        ╰─── [r] refresh · [q] quit ─╯
+        ╰───────── [q] quit ─────────╯
 ```
+
+Sparkles drift around the creature (and warm with its stage); when a token
+refresh pushes you up a level, the card throws a brief **✦ LEVEL UP! ✦** party.
+The ledger re-scans automatically every 20s, so there's nothing to press.
 
 > _Replace this ASCII sketch with a real screen recording — see [Demo](#demo)._
 
@@ -48,7 +53,7 @@ In a **separate terminal window** (it's a full-screen TUI — it can't share the
 tokotchi
 ```
 
-`[r]` refreshes the ledger · `[q]` quits.
+It re-scans your token ledger automatically every 20s (and once on launch), so there's nothing to tend — `[q]` quits.
 
 ## Leveling & evolution
 

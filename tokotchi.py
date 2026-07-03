@@ -17,6 +17,7 @@ import curses
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -29,6 +30,7 @@ STATE = os.path.join(HOME, ".claude", ".tokotchi_state.json")  # last level (for
 UNIT = 1_000_000          # 1 level-unit = 1M tokens; level = floor(sqrt(total/UNIT))
 AUTO_REFRESH_SECS = 20     # background ledger re-scan cadence
 CELEBRATE_SECS = 45        # how long the statusline flashes a level-up after it happens
+CELEBRATE_TUI_SECS = 8     # how long the live TUI throws a level-up party
 
 
 LEDGER_REPO = "https://github.com/rynzuki/claude-token-ledger"
@@ -130,12 +132,16 @@ COLORS = {
     "muted": 244,    # secondary text / footer
     "faint": 239,    # empty xp track
     "bar": 173,      # filled xp
+    "spark": 230,    # pale gold — celebration sparkles
 }
 
 PANEL_W = 38
-PANEL_H = 18
+PANEL_H = 19
 CREATURE_TOP = 1   # interior row where the creature's band begins
 CREATURE_BAND = 6  # rows reserved for the creature (art is 5 tall + 1 for the bob)
+
+# Ambient/celebration sparkle glyphs (twinkle over each particle's short life).
+SPARKLE_CHARS = ["·", "✦", "✧", "⋆", "✳"]
 
 
 def stage_for(level):
@@ -144,6 +150,14 @@ def stage_for(level):
         if level >= st[0]:
             chosen = st
     return chosen
+
+
+def next_stage(level):
+    """First stage the pet hasn't reached yet, or None if it's fully evolved."""
+    for st in STAGES:
+        if st[0] > level:
+            return st
+    return None
 
 
 # One emoji per evolution stage — used by the `level` CLI / statusline.
@@ -223,6 +237,35 @@ def _box(stdscr, top, left, h, w, attr):
     _add(stdscr, top + h - 1, left, "╰" + "─" * (w - 2) + "╯", attr)
 
 
+# ── ambient sparkles ─────────────────────────────────────────────────────────
+# Particles live only in the creature band (interior rows 0..BAND), so the status
+# rows below never flicker. Each is [row, col, char, age, ttl]; they twinkle
+# dim→bright→dim over their short life. Denser during a level-up celebration.
+def step_particles(state, band_rows, iw, celebrating):
+    ps = state["particles"]
+    for p in ps:
+        p[3] += 1
+    ps[:] = [p for p in ps if p[3] < p[4]]
+
+    spawn_chance = 0.85 if celebrating else 0.22
+    cap = 26 if celebrating else 10
+    if len(ps) < cap and random.random() < spawn_chance:
+        row = random.randint(0, band_rows)
+        col = random.randint(0, iw - 1)
+        char = random.choice(SPARKLE_CHARS)
+        ttl = random.randint(10, 22)
+        ps.append([row, col, char, 0, ttl])
+
+
+def render_particles(stdscr, state, top, left, cp, celebrating):
+    key = "spark" if celebrating else None
+    for row, col, char, age, ttl in state["particles"]:
+        phase = age / ttl
+        attr = curses.A_BOLD if 0.33 <= phase <= 0.66 else curses.A_DIM
+        color = cp(key) if key else cp(state["ckey"])
+        _add(stdscr, top + 1 + row, left + 1 + col, char, color | attr)
+
+
 def draw(stdscr, state, frame):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -230,7 +273,9 @@ def draw(stdscr, state, frame):
     total = state["total"]
     lvl = level_for(total)
     _, name, ckey, frames = stage_for(lvl)
+    state["ckey"] = ckey
     frac, into, span = progress(total)
+    celebrating = time.time() < state.get("celebrate_until", 0.0)
 
     def cp(key):
         return curses.color_pair(state["pairs"].get(key, 0))
@@ -257,17 +302,25 @@ def draw(stdscr, state, frame):
     title = " ❋ TOKOTCHI ❋ "
     _add(stdscr, top, left + (PANEL_W - len(title)) // 2, title, cp("accent") | curses.A_BOLD)
 
+    # sparkles first, so the creature always renders on top of them
+    step_particles(state, CREATURE_TOP + CREATURE_BAND, iw, celebrating)
+    render_particles(stdscr, state, top, left, cp, celebrating)
+
     # creature — the ONLY thing the bob moves, kept inside its reserved band
     blink = (frame % 36) in (0, 1)
     art = frames[1] if blink else frames[0]
     bob = 1 if (frame // 7) % 2 == 0 else 0
-    glow = curses.A_BOLD if name == "Elder" else 0
+    glow = curses.A_BOLD if (name == "Elder" or celebrating) else 0
     for i, line in enumerate(art):
         panel(CREATURE_TOP + bob + i, line, cp(ckey) | glow)
 
     # status block — fixed rows, never affected by the bob
     base = CREATURE_TOP + CREATURE_BAND + 1   # interior row 8
-    panel(base, name, cp(ckey) | curses.A_BOLD)
+    if celebrating:
+        pulse = curses.A_BOLD if (frame // 4) % 2 == 0 else curses.A_DIM
+        panel(base, "✦ LEVEL UP! ✦", cp("spark") | pulse)
+    else:
+        panel(base, name, cp(ckey) | curses.A_BOLD)
     panel(base + 1, f"Lv {lvl}", cp("cream") | curses.A_BOLD)
 
     # xp bar, drawn as filled + empty tracks
@@ -279,10 +332,15 @@ def draw(stdscr, state, frame):
     _add(stdscr, barrow, barcol + filled, "━" * (bar_w - filled), cp("faint"))
     panel(base + 4, f"{humanize(into)} / {humanize(span)} → Lv {lvl + 1}", cp("muted"))
 
-    panel(base + 6, f"Σ {humanize(total)}", cp(ckey))
+    # next-evolution preview (or a max-form badge for the Elder)
+    nxt = next_stage(lvl)
+    evo = f"Next: {nxt[1]} at Lv {nxt[0]}" if nxt else "✦ fully evolved ✦"
+    panel(base + 5, evo, cp("muted"))
 
-    # footer inset on the bottom border
-    foot = " [r] refresh   ·   [q] quit "
+    panel(base + 7, f"Σ {humanize(total)}", cp(ckey))
+
+    # footer inset on the bottom border (auto-refreshes every AUTO_REFRESH_SECS)
+    foot = " [q] quit "
     _add(stdscr, top + PANEL_H - 1, left + (PANEL_W - len(foot)) // 2, foot, cp("muted"))
     stdscr.refresh()
 
@@ -311,14 +369,25 @@ def run(stdscr):
             except curses.error:
                 pass
 
-    state = {"total": read_total(), "pairs": pairs, "syncing": True}
+    total0 = read_total()
+    state = {
+        "total": total0,
+        "pairs": pairs,
+        "syncing": True,
+        "particles": [],
+        "ckey": stage_for(level_for(total0))[2],
+        "celebrate_until": 0.0,
+    }
 
     # initial + periodic background refresh (never blocks the animation)
     stop = threading.Event()
 
     def worker(once=False):
         refresh_ledger()
-        state["total"] = read_total()
+        new_total = read_total()
+        if level_for(new_total) > level_for(state["total"]):
+            state["celebrate_until"] = time.time() + CELEBRATE_TUI_SECS
+        state["total"] = new_total
         state["syncing"] = False
 
     threading.Thread(target=worker, daemon=True).start()
@@ -340,9 +409,6 @@ def run(stdscr):
                 ch = -1
             if ch in (ord("q"), ord("Q"), 27):
                 break
-            if ch in (ord("r"), ord("R")):
-                state["syncing"] = True
-                threading.Thread(target=worker, daemon=True).start()
             if ch == curses.KEY_RESIZE:
                 stdscr.erase()
     finally:
