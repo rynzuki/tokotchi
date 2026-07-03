@@ -50,6 +50,17 @@ enum Mode {
     Normal,
     Naming(String),
     Graveyard,
+    Dev,
+}
+
+/// Dev/admin overrides — in-memory only, never persisted, and only reachable when
+/// TOKOTCHI_DEV is set. Lets you force mood/level/celebration to preview states without
+/// touching the real pet. (Kill is a real action handled separately.)
+#[derive(Default)]
+struct Dev {
+    level: Option<u64>,
+    mood: Option<Mood>,
+    celebrate_until: f64,
 }
 
 // ── screen buffer ─────────────────────────────────────────────────────────────
@@ -160,6 +171,7 @@ fn run_ui() -> io::Result<bool> {
     let mut mode = Mode::Normal;
     let mut toast: Option<(String, f64)> = None;
     let mut happy_until = 0.0f64; // plays the Happy clip briefly after a feed/pet
+    let mut dev_ov = Dev::default(); // dev overrides (only ever touched when `dev` is true)
 
     let (mut w, mut h) = terminal::size()?;
     execute!(out, Clear(ClearType::All))?;
@@ -187,7 +199,7 @@ fn run_ui() -> io::Result<bool> {
         }
 
         back.clear();
-        compose(&mut back, &shared, &mut particles, frame, &mode, &toast, now < happy_until, now);
+        compose(&mut back, &shared, &mut particles, frame, &mode, &toast, now < happy_until, &dev_ov, now);
         flush_diff(&mut out, &mut front, &back)?;
         frame = frame.wrapping_add(1);
 
@@ -196,7 +208,7 @@ fn run_ui() -> io::Result<bool> {
                 // Only act on key *press* — Windows Console also emits Repeat/Release events
                 // for a single keystroke, which would otherwise fire each action 2-3×.
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    if handle_key(k.code, &mut mode, &shared, &mut toast, &mut happy_until) {
+                    if handle_key(k.code, &mut mode, &shared, &mut toast, &mut happy_until, dev, &mut dev_ov) {
                         return Ok(false); // quit
                     }
                 }
@@ -216,12 +228,15 @@ fn run_ui() -> io::Result<bool> {
 }
 
 /// Returns true if the app should quit.
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     code: KeyCode,
     mode: &mut Mode,
     shared: &Mutex<Shared>,
     toast: &mut Option<(String, f64)>,
     happy_until: &mut f64,
+    dev: bool,
+    dev_ov: &mut Dev,
 ) -> bool {
     let now = ledger::now_secs();
     match mode {
@@ -255,10 +270,49 @@ fn handle_key(
                 *mode = Mode::Naming(cur);
             }
             KeyCode::Char('g') => *mode = Mode::Graveyard,
+            KeyCode::Char('d') if dev => *mode = Mode::Dev,
+            _ => {}
+        },
+        Mode::Dev => match code {
+            KeyCode::Char('d') | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => *mode = Mode::Normal,
+            KeyCode::Char('1') => dev_ov.mood = Some(Mood::Happy),
+            KeyCode::Char('2') => dev_ov.mood = Some(Mood::Content),
+            KeyCode::Char('3') => dev_ov.mood = Some(Mood::Hungry),
+            KeyCode::Char('4') => dev_ov.mood = Some(Mood::Grumpy),
+            KeyCode::Char('5') => dev_ov.mood = Some(Mood::Sick),
+            KeyCode::Char('[') => dev_ov.level = Some(stage_step(cur_level(shared, dev_ov), -1)),
+            KeyCode::Char(']') => dev_ov.level = Some(stage_step(cur_level(shared, dev_ov), 1)),
+            KeyCode::Char('+') | KeyCode::Char('=') => dev_ov.level = Some(cur_level(shared, dev_ov).saturating_add(1)),
+            KeyCode::Char('-') => dev_ov.level = Some(cur_level(shared, dev_ov).saturating_sub(1).max(1)),
+            KeyCode::Char('c') => dev_ov.celebrate_until = now + CELEBRATE_TUI_SECS,
+            KeyCode::Char('r') => *dev_ov = Dev::default(),
+            KeyCode::Char('k') => {
+                // the one real action: force vitality to 0 and run the actual death path
+                let total = shared.lock().unwrap().total;
+                let st = state::update(now, total, |s| {
+                    s.last_activity = now - (care::DEATH_DAYS + 1.0) * 86_400.0;
+                    s.fed_until = 0.0;
+                    care::maybe_reap(s, total, now);
+                });
+                shared.lock().unwrap().st = st;
+                *dev_ov = Dev::default();
+            }
             _ => {}
         },
     }
     false
+}
+
+/// The level the dev panel is currently acting on (override if set, else the real level).
+fn cur_level(shared: &Mutex<Shared>, dev_ov: &Dev) -> u64 {
+    dev_ov.level.unwrap_or_else(|| shared.lock().unwrap().st.level)
+}
+
+/// Step to the previous/next evolution stage's entry level (for `[` / `]`).
+fn stage_step(level: u64, dir: i32) -> u64 {
+    let cur = STAGES.iter().rposition(|s| level >= s.min_level).unwrap_or(0);
+    let next = (cur as i32 + dir).clamp(0, STAGES.len() as i32 - 1) as usize;
+    STAGES[next].min_level
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -378,6 +432,7 @@ fn compose(
     mode: &Mode,
     toast: &Option<(String, f64)>,
     happy: bool,
+    dev: &Dev,
     now: f64,
 ) {
     let (w, h) = (buf.w, buf.h);
@@ -412,13 +467,15 @@ fn compose(
         return;
     }
 
-    let title = " ❋ TOKOTCHI ❋ ";
+    let in_dev = matches!(mode, Mode::Dev);
+    let title = if in_dev { " ⚙ DEV ⚙ " } else { " ❋ TOKOTCHI ❋ " };
     buf.put(top, left + (PANEL_W - char_len(title)) / 2, title, ACCENT, true, false);
 
-    let lvl = st.level;
+    // dev overrides (all None/0 in a shipped binary → identical to normal rendering)
+    let lvl = dev.level.unwrap_or(st.level);
     let stage = stage_for(lvl);
-    let mood = care::mood(&st, now);
-    let celebrating = now < st.celebrate_until;
+    let mood = dev.mood.unwrap_or_else(|| care::mood(&st, now));
+    let celebrating = now < st.celebrate_until.max(dev.celebrate_until);
     let blink = (frame % 36) < 2;
     let ckey = if mood == Mood::Sick { MUTED } else { stage.color };
 
@@ -507,8 +564,13 @@ fn compose(
     // per-generation Σ (the lifetime total is available in the statusline / wasted-on-claude)
     panel!(base + 8, format!("Σ {}", humanize(total.saturating_sub(st.birth_sigma))), ckey, false, false);
 
-    // footer
-    let foot = " [f]eed [p]et [n]ame [g]rave [q]uit ";
+    // footer — dev key legend when the dev panel is open, otherwise the normal controls
+    let foot = if in_dev {
+        panel!(0, "1-5 mood  [ ]stage  +/-lvl", MUTED, false, true);
+        " k kill · c fx · r reset · d exit "
+    } else {
+        " [f]eed [p]et [n]ame [g]rave [q]uit "
+    };
     buf.put(top + PANEL_H - 1, left + (PANEL_W - char_len(foot)) / 2, foot, MUTED, false, false);
 }
 

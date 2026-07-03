@@ -117,6 +117,20 @@ Clips: `idle` (required), `blink`, `sad`, `happy`, `celebrate`. To add an animat
 
 `./dev.sh` runs a live-reloading loop — edit any `src/*.rs` **or** art file and the running TUI cleanly relaunches with your change.
 
+**Dev/admin panel** — set `TOKOTCHI_DEV=1` (as `dev.sh` does), then press `d` in the TUI to open a console for forcing any state instantly:
+
+| key | action |
+|---|---|
+| `1`–`5` | set mood: Happy / Content / Hungry / Grumpy / Sick |
+| `[` / `]` | jump to the previous / next evolution stage |
+| `+` / `-` | level ± 1 |
+| `c` | play the level-up celebration |
+| `r` | reset all overrides back to the real pet |
+| `k` | **kill** — a real death (records the graveyard, hatches a new egg) |
+| `d` / `Esc` / `q` | close the panel |
+
+Mood/level are **preview overrides** (in-memory, not persisted, don't touch the saved pet or statusline) so you can eyeball any state — including stages your token count can't reach — without side effects. `k` is the only change that persists. The whole panel is inert unless `TOKOTCHI_DEV` is set, so shipped binaries are unaffected.
+
 ## License
 
 MIT © Yannic Oberhausen
