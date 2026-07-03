@@ -1,0 +1,52 @@
+name: release
+
+# Push a version tag to build binaries for macOS/Linux/Windows and publish a GitHub Release:
+#   git tag v0.1.0 && git push --tags
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,         target: aarch64-apple-darwin }
+          - { os: macos-13,         target: x86_64-apple-darwin }
+          - { os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          dir="target/${{ matrix.target }}/release"
+          pkg="tokotchi-${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$pkg.zip" "./$dir/tokotchi.exe"
+            echo "ASSET=$pkg.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$pkg.tar.gz" -C "$dir" tokotchi
+            echo "ASSET=$pkg.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true

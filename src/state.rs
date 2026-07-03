@@ -62,9 +62,7 @@ pub struct State {
 }
 
 pub fn state_path() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-        .join(".claude")
-        .join(".tokotchi_state.json")
+    crate::ledger::home().join(".claude").join(".tokotchi_state.json")
 }
 
 /// A freshly grandfathered Generation-1 pet: birth_sigma=0 (so it keeps its all-time level),

@@ -16,8 +16,12 @@ use walkdir::WalkDir;
 
 pub type Ledger = BTreeMap<String, u64>; // sessionId -> total tokens (BTreeMap = stable key order)
 
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+/// The user's home dir, cross-platform: `HOME` on macOS/Linux, `USERPROFILE` on Windows.
+pub fn home() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 pub fn ledger_path() -> PathBuf {
