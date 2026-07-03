@@ -10,7 +10,7 @@ pub const AUTO_REFRESH_SECS: u64 = 20; // background ledger re-scan cadence
 
 // Card geometry + creature band (bob/particles stay inside the band; status rows are fixed).
 pub const PANEL_W: u16 = 38;
-pub const PANEL_H: u16 = 18;
+pub const PANEL_H: u16 = 20;
 pub const CREATURE_TOP: u16 = 1;
 pub const CREATURE_BAND: u16 = 6;
 
@@ -27,6 +27,11 @@ pub const SPARKLE_CHARS: [char; 5] = ['·', '✦', '✧', '⋆', '✳'];
 
 pub fn level_for(total: u64) -> u64 {
     (total / UNIT).isqrt().max(1)
+}
+
+/// Per-generation level: only tokens accrued since this pet hatched count.
+pub fn level_for_gen(current_sigma: u64, birth_sigma: u64) -> u64 {
+    level_for(current_sigma.saturating_sub(birth_sigma))
 }
 
 /// (fraction 0..1, tokens_into_level, tokens_needed_for_level) for the current level.
@@ -54,13 +59,14 @@ pub fn humanize(n: u64) -> String {
     }
 }
 
-/// One evolution stage. `frames[1]` is the blink frame; both are 5 lines, equal width.
+/// One evolution stage. `frames` = [base, blink, sad]; all 5 lines, matching per-line
+/// widths so blinking / mood changes never reflow the art.
 pub struct Stage {
     pub min_level: u64,
     pub name: &'static str,
     pub emoji: &'static str,
     pub color: u8, // 256-color index; stages ramp warmer as they grow
-    pub frames: [[&'static str; 5]; 2],
+    pub frames: [[&'static str; 5]; 3],
 }
 
 // Evolution ramp — pale cream → tan → gold → clay → coral → bright clay.
@@ -73,6 +79,7 @@ pub static STAGES: [Stage; 6] = [
         frames: [
             ["  ___ ", " /   \\", "|     |", "|     |", " \\___/"],
             ["  ___ ", " /   \\", "| . . |", "|     |", " \\___/"],
+            ["  ___ ", " /   \\", "| u u |", "|     |", " \\___/"],
         ],
     },
     Stage {
@@ -83,6 +90,7 @@ pub static STAGES: [Stage; 6] = [
         frames: [
             [" _____ ", "/     \\", "| o o |", "|  ω  |", "\\_____/"],
             [" _____ ", "/     \\", "| - - |", "|  ω  |", "\\_____/"],
+            [" _____ ", "/     \\", "| u u |", "|  ω  |", "\\_____/"],
         ],
     },
     Stage {
@@ -93,6 +101,7 @@ pub static STAGES: [Stage; 6] = [
         frames: [
             ["   ,   ", "  (|)  ", " /o o\\ ", "( \\_/ )", " \\___/ "],
             ["   ,   ", "  (|)  ", " /- -\\ ", "( \\_/ )", " \\___/ "],
+            ["   ,   ", "  (|)  ", " /u u\\ ", "( \\_/ )", " \\___/ "],
         ],
     },
     Stage {
@@ -103,6 +112,7 @@ pub static STAGES: [Stage; 6] = [
         frames: [
             [" /\\_/\\ ", "( o.o )", " > ^ < ", "/|   |\\", " |___| "],
             [" /\\_/\\ ", "( -.- )", " > ^ < ", "/|   |\\", " |___| "],
+            [" /\\_/\\ ", "( ;.; )", " > _ < ", "/|   |\\", " |___| "],
         ],
     },
     Stage {
@@ -113,6 +123,7 @@ pub static STAGES: [Stage; 6] = [
         frames: [
             ["  __/\\__  ", " ( o  o ) ", "<   VV   >", " \\ ~~~~ / ", " /|    |\\ "],
             ["  __/\\__  ", " ( -  - ) ", "<   VV   >", " \\ ~~~~ / ", " /|    |\\ "],
+            ["  __/\\__  ", " ( u  u ) ", "<   ~~   >", " \\ ~~~~ / ", " /|    |\\ "],
         ],
     },
     Stage {
@@ -123,6 +134,7 @@ pub static STAGES: [Stage; 6] = [
         frames: [
             ["✦  __/\\__  ✦", "  ( ◕  ◕ )  ", " <   WW   > ", "✦ \\ ~~~~ / ✦", "  /|    |\\  "],
             ["✦  __/\\__  ✦", "  ( ─  ─ )  ", " <   WW   > ", "✦ \\ ~~~~ / ✦", "  /|    |\\  "],
+            ["✦  __/\\__  ✦", "  ( u  u )  ", " <   ~~   > ", "✦ \\ ~~~~ / ✦", "  /|    |\\  "],
         ],
     },
 ];
@@ -183,13 +195,22 @@ mod tests {
     }
 
     #[test]
-    fn blink_frame_matches_base_per_line() {
-        // Art lines are intentionally ragged-width (each is centered independently),
-        // but frame1 (blink) must match frame0 line-for-line so blinking never reflows.
+    fn alt_frames_match_base_per_line() {
+        // Art lines are intentionally ragged-width (each is centered independently), but the
+        // blink (1) and sad (2) frames must match base (0) line-for-line so nothing reflows.
         for st in STAGES.iter() {
-            for (a, b) in st.frames[0].iter().zip(st.frames[1].iter()) {
-                assert_eq!(a.chars().count(), b.chars().count(), "stage {} blink reflows", st.name);
+            for alt in [1usize, 2] {
+                for (a, b) in st.frames[0].iter().zip(st.frames[alt].iter()) {
+                    assert_eq!(a.chars().count(), b.chars().count(), "stage {} frame {alt} reflows", st.name);
+                }
             }
         }
+    }
+
+    #[test]
+    fn per_generation_level() {
+        assert_eq!(level_for_gen(2_401_000_000, 0), 49); // grandfathered gen 1
+        assert_eq!(level_for_gen(2_401_000_000, 2_400_000_000), 1); // reborn: ~1M since birth
+        assert_eq!(level_for_gen(2_400_000_000, 2_500_000_000), 1); // birth after current → floor 1
     }
 }

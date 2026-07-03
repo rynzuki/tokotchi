@@ -1,10 +1,6 @@
-//! The full-screen pet card (crossterm). Hand-drawn to match the original curses look:
-//! rounded border, ASCII creature with blink + bob, ambient sparkle particles confined
-//! to the creature band, an ~8s level-up celebration, an xp bar, and the Σ total.
-//!
-//! Rendering is double-buffered: each frame is composed into a back buffer, then only the
-//! cells that changed since the last frame are written to the terminal. This avoids the
-//! whole-screen clear that made the card flicker.
+//! The full-screen pet card (crossterm). Hand-drawn, double-buffered (diff render, no
+//! full-clear → no flicker). Shows the care layer — mood-driven face/tint, a heart meter,
+//! streak, name, generation — and lets you feed/pet/name it and browse the graveyard.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
@@ -17,8 +13,10 @@ use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetFor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 
-use crate::ledger;
+use crate::care::{self, CareResult, Mood};
 use crate::model::*;
+use crate::state::{self, State};
+use crate::ledger;
 
 const NEED_TTY: &str = "\
 Tokotchi needs a real terminal — it can't run inside Claude Code's `!` prompt
@@ -30,19 +28,27 @@ and run:
     tokotchi
 ";
 
-/// Shared with the background refresh thread.
+/// Dev-only live reload (see dev.sh): exit cleanly with this code when a src file changes.
+const RELOAD_EXIT_CODE: i32 = 69;
+const NAME_MAX: usize = 12;
+
 struct Shared {
     total: u64,
-    celebrate_until: f64,
+    st: State,
 }
 
-/// A drifting sparkle: lives only in the creature band, twinkles over its short life.
 struct Particle {
     row: i32,
     col: i32,
     ch: char,
     age: i32,
     ttl: i32,
+}
+
+enum Mode {
+    Normal,
+    Naming(String),
+    Graveyard,
 }
 
 // ── screen buffer ─────────────────────────────────────────────────────────────
@@ -70,14 +76,11 @@ impl Buffer {
     fn new(w: u16, h: u16) -> Self {
         Buffer { w, h, cells: vec![Cell::default(); w as usize * h as usize] }
     }
-
     fn clear(&mut self) {
         for c in &mut self.cells {
             *c = Cell::default();
         }
     }
-
-    /// Write `text` at (row, col), one cell per char, clipped to the buffer width.
     fn put(&mut self, row: u16, col: u16, text: &str, fg: u8, bold: bool, dim: bool) {
         if row >= self.h {
             return;
@@ -93,8 +96,6 @@ impl Buffer {
     }
 }
 
-/// Restores the terminal on any exit path (including panics) — curses' wrapper() did
-/// this automatically; crossterm does not, so a panicking draw would strand raw mode.
 struct TermGuard;
 
 impl TermGuard {
@@ -117,30 +118,56 @@ pub fn run() {
         print!("{NEED_TTY}");
         return;
     }
-    if let Err(e) = run_ui() {
-        eprintln!("Tokotchi couldn't start the terminal UI ({e}).\n{NEED_TTY}");
+    match run_ui() {
+        Ok(true) => std::process::exit(RELOAD_EXIT_CODE),
+        Ok(false) => {}
+        Err(e) => eprintln!("Tokotchi couldn't start the terminal UI ({e}).\n{NEED_TTY}"),
     }
 }
 
-fn run_ui() -> io::Result<()> {
+fn latest_src_mtime() -> Option<std::time::SystemTime> {
+    let mut latest: Option<std::time::SystemTime> = None;
+    for entry in std::fs::read_dir("src").ok()?.flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("rs") {
+            if let Ok(m) = entry.metadata().and_then(|md| md.modified()) {
+                latest = Some(latest.map_or(m, |l| l.max(m)));
+            }
+        }
+    }
+    latest
+}
+
+fn run_ui() -> io::Result<bool> {
     let _guard = TermGuard::enter()?;
 
-    let shared = Arc::new(Mutex::new(Shared {
-        total: ledger::total(&ledger::read_ledger()),
-        celebrate_until: 0.0,
-    }));
+    let now = ledger::now_secs();
+    let total = ledger::total(&ledger::read_ledger());
+    let st = state::load_or_migrate(now, total).0;
+    let shared = Arc::new(Mutex::new(Shared { total, st }));
     spawn_refresh(Arc::clone(&shared));
 
     let mut out = io::stdout();
     let mut particles: Vec<Particle> = Vec::new();
     let mut frame: u64 = 0;
+    let mut mode = Mode::Normal;
+    let mut toast: Option<(String, f64)> = None;
 
     let (mut w, mut h) = terminal::size()?;
     execute!(out, Clear(ClearType::All))?;
-    let mut front = Buffer::new(w, h); // mirrors what's on screen (blank after the clear)
+    let mut front = Buffer::new(w, h);
     let mut back = Buffer::new(w, h);
 
+    let dev = std::env::var_os("TOKOTCHI_DEV").is_some();
+    let start_mtime = if dev { latest_src_mtime() } else { None };
+
     loop {
+        let now = ledger::now_secs();
+        if let Some((_, until)) = &toast {
+            if now >= *until {
+                toast = None;
+            }
+        }
+
         let (nw, nh) = terminal::size()?;
         if (nw, nh) != (w, h) {
             w = nw;
@@ -151,25 +178,88 @@ fn run_ui() -> io::Result<()> {
         }
 
         back.clear();
-        compose(&mut back, &shared, &mut particles, frame);
+        compose(&mut back, &shared, &mut particles, frame, &mode, &toast, now);
         flush_diff(&mut out, &mut front, &back)?;
         frame = frame.wrapping_add(1);
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(k) => match k.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => break,
-                    _ => {}
-                },
+                Event::Key(k) => {
+                    if handle_key(k.code, &mut mode, &shared, &mut toast) {
+                        return Ok(false); // quit
+                    }
+                }
                 Event::Resize(..) => {}
                 _ => {}
             }
         }
+
+        if dev && frame % 5 == 0 {
+            if let (Some(start), Some(cur)) = (start_mtime, latest_src_mtime()) {
+                if cur > start {
+                    return Ok(true);
+                }
+            }
+        }
     }
-    Ok(())
 }
 
-/// Emit only the cells that differ from the last frame — no whole-screen clear.
+/// Returns true if the app should quit.
+fn handle_key(code: KeyCode, mode: &mut Mode, shared: &Mutex<Shared>, toast: &mut Option<(String, f64)>) -> bool {
+    let now = ledger::now_secs();
+    match mode {
+        Mode::Naming(buf) => match code {
+            KeyCode::Enter => {
+                let name = buf.trim().to_string();
+                let total = shared.lock().unwrap().total;
+                let st = state::update(now, total, |s| {
+                    s.name = if name.is_empty() { None } else { Some(name.clone()) };
+                });
+                shared.lock().unwrap().st = st;
+                *mode = Mode::Normal;
+            }
+            KeyCode::Esc => *mode = Mode::Normal,
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() && buf.chars().count() < NAME_MAX => buf.push(c),
+            _ => {}
+        },
+        Mode::Graveyard => match code {
+            KeyCode::Char('g') | KeyCode::Char('q') | KeyCode::Esc => *mode = Mode::Normal,
+            _ => {}
+        },
+        Mode::Normal => match code {
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return true,
+            KeyCode::Char('f') => interact(shared, toast, now, care::feed, "*nom*  ♥", "already fed…"),
+            KeyCode::Char('p') => interact(shared, toast, now, care::pet, "♥", "still purring…"),
+            KeyCode::Char('n') => {
+                let cur = shared.lock().unwrap().st.name.clone().unwrap_or_default();
+                *mode = Mode::Naming(cur);
+            }
+            KeyCode::Char('g') => *mode = Mode::Graveyard,
+            _ => {}
+        },
+    }
+    false
+}
+
+fn interact(
+    shared: &Mutex<Shared>,
+    toast: &mut Option<(String, f64)>,
+    now: f64,
+    action: fn(&mut State, f64) -> CareResult,
+    ok_msg: &str,
+    cd_msg: &str,
+) {
+    let total = shared.lock().unwrap().total;
+    let mut res = CareResult::Cooldown;
+    let st = state::update(now, total, |s| res = action(s, now));
+    shared.lock().unwrap().st = st;
+    let msg = if res == CareResult::Done { ok_msg } else { cd_msg };
+    *toast = Some((msg.to_string(), now + 1.6));
+}
+
 fn flush_diff(out: &mut impl Write, front: &mut Buffer, back: &Buffer) -> io::Result<()> {
     for row in 0..back.h {
         for col in 0..back.w {
@@ -191,9 +281,6 @@ fn flush_diff(out: &mut impl Write, front: &mut Buffer, back: &Buffer) -> io::Re
     out.flush()
 }
 
-/// One immediate refresh, then a re-scan every AUTO_REFRESH_SECS. Threads are daemonic:
-/// they die when the process exits after the TUI loop returns. A level increase across a
-/// refresh opens the celebration window.
 fn spawn_refresh(shared: Arc<Mutex<Shared>>) {
     let once = Arc::clone(&shared);
     thread::spawn(move || do_refresh(&once));
@@ -204,12 +291,25 @@ fn spawn_refresh(shared: Arc<Mutex<Shared>>) {
 }
 
 fn do_refresh(shared: &Mutex<Shared>) {
-    let new_total = ledger::total(&ledger::refresh());
-    let mut s = shared.lock().unwrap();
-    if level_for(new_total) > level_for(s.total) {
-        s.celebrate_until = ledger::now_secs() + CELEBRATE_TUI_SECS;
-    }
-    s.total = new_total;
+    let now = ledger::now_secs();
+    let total = ledger::total(&ledger::refresh());
+    // same owned-field updates as `tokotchi level`, so the pet lives/grows while the TUI is open
+    let st = state::update(now, total, |s| {
+        if total > s.last_seen_sigma {
+            s.last_activity = now;
+            s.last_seen_sigma = total;
+        }
+        care::maybe_reap(s, total, now);
+        let lvl = level_for_gen(total, s.birth_sigma);
+        if lvl > s.level {
+            s.celebrate_until = now + CELEBRATE_TUI_SECS;
+        }
+        s.level = lvl;
+        care::credit_streak(s, now);
+    });
+    let mut sh = shared.lock().unwrap();
+    sh.total = total;
+    sh.st = st;
 }
 
 // ── particles ────────────────────────────────────────────────────────────────
@@ -218,7 +318,6 @@ fn step_particles(ps: &mut Vec<Particle>, band_rows: i32, iw: i32, celebrating: 
         p.age += 1;
     }
     ps.retain(|p| p.age < p.ttl);
-
     let (chance, cap) = if celebrating { (0.85, 26) } else { (0.22, 10) };
     if (ps.len() as i32) < cap && fastrand::f64() < chance {
         ps.push(Particle {
@@ -231,7 +330,7 @@ fn step_particles(ps: &mut Vec<Particle>, band_rows: i32, iw: i32, celebrating: 
     }
 }
 
-// ── compose one frame into the back buffer ─────────────────────────────────────
+// ── compose one frame ──────────────────────────────────────────────────────────
 fn char_len(s: &str) -> u16 {
     s.chars().count() as u16
 }
@@ -246,32 +345,32 @@ fn draw_box(buf: &mut Buffer, top: u16, left: u16, ph: u16, pw: u16, fg: u8) {
     buf.put(top + ph - 1, left, &format!("╰{dashes}╯"), fg, false, false);
 }
 
-fn compose(buf: &mut Buffer, shared: &Mutex<Shared>, particles: &mut Vec<Particle>, frame: u64) {
-    let w = buf.w;
-    let h = buf.h;
-
-    let (total, celebrate_until) = {
+fn compose(
+    buf: &mut Buffer,
+    shared: &Mutex<Shared>,
+    particles: &mut Vec<Particle>,
+    frame: u64,
+    mode: &Mode,
+    toast: &Option<(String, f64)>,
+    now: f64,
+) {
+    let (w, h) = (buf.w, buf.h);
+    let (total, st) = {
         let s = shared.lock().unwrap();
-        (s.total, s.celebrate_until)
+        (s.total, s.st.clone())
     };
-    let lvl = level_for(total);
-    let stage = stage_for(lvl);
-    let ckey = stage.color;
-    let (frac, into, span) = progress(total);
-    let celebrating = ledger::now_secs() < celebrate_until;
 
     // too small for the card → compact one-liner
     if h < PANEL_H + 1 || w < PANEL_W + 1 {
-        let line = format!("Tokotchi · Lv {lvl} · Σ {}  (resize for full view)", humanize(total));
+        let line = format!("Tokotchi · Lv {} · Σ {}  (resize)", st.level, humanize(total));
         buf.put(0, 0, &line, ACCENT, false, false);
         return;
     }
 
     let top = (h - PANEL_H) / 2;
     let left = (w - PANEL_W) / 2;
-    let iw = PANEL_W - 2; // interior width
+    let iw = PANEL_W - 2;
 
-    // Center `text` on interior `row` (0-based, under the top border).
     macro_rules! panel {
         ($row:expr, $text:expr, $fg:expr, $bold:expr, $dim:expr) => {{
             let t: &str = &$text;
@@ -282,57 +381,124 @@ fn compose(buf: &mut Buffer, shared: &Mutex<Shared>, particles: &mut Vec<Particl
 
     draw_box(buf, top, left, PANEL_H, PANEL_W, ACCENT);
 
-    // title inset on the top border
+    if let Mode::Graveyard = mode {
+        compose_graveyard(buf, top, left, iw, &st);
+        return;
+    }
+
     let title = " ❋ TOKOTCHI ❋ ";
     buf.put(top, left + (PANEL_W - char_len(title)) / 2, title, ACCENT, true, false);
 
-    // sparkles first, so the creature always renders on top of them
+    let lvl = st.level;
+    let stage = stage_for(lvl);
+    let mood = care::mood(&st, now);
+    let celebrating = now < st.celebrate_until;
+    let ckey = if mood == Mood::Sick { MUTED } else { stage.color };
+
+    // sparkles behind the creature
     step_particles(particles, (CREATURE_TOP + CREATURE_BAND) as i32, iw as i32, celebrating);
     let spark_fg = if celebrating { SPARK } else { ckey };
     let mut chbuf = [0u8; 4];
     for p in particles.iter() {
         let phase = p.age as f64 / p.ttl as f64;
-        let (bold, dim) = if (0.33..=0.66).contains(&phase) { (true, false) } else { (false, true) };
-        buf.put(top + 1 + p.row as u16, left + 1 + p.col as u16, p.ch.encode_utf8(&mut chbuf), spark_fg, bold, dim);
+        let (b, d) = if (0.33..=0.66).contains(&phase) { (true, false) } else { (false, true) };
+        buf.put(top + 1 + p.row as u16, left + 1 + p.col as u16, p.ch.encode_utf8(&mut chbuf), spark_fg, b, d);
     }
 
-    // creature — the ONLY thing the bob moves, kept inside its reserved band
+    // creature — mood picks the face; bob stays in the band
     let blink = (frame % 36) < 2;
-    let art = if blink { &stage.frames[1] } else { &stage.frames[0] };
+    let art = if mood.is_down() {
+        if blink { &stage.frames[1] } else { &stage.frames[2] }
+    } else if blink {
+        &stage.frames[1]
+    } else {
+        &stage.frames[0]
+    };
     let bob: u16 = if (frame / 7) % 2 == 0 { 1 } else { 0 };
-    let glow = stage.name == "Elder" || celebrating;
+    let glow = (stage.name == "Elder" && mood != Mood::Sick) || celebrating;
     for (i, line) in art.iter().enumerate() {
         panel!(CREATURE_TOP + bob + i as u16, line, ckey, glow, false);
     }
 
-    // status block — fixed rows, never affected by the bob
-    let base = CREATURE_TOP + CREATURE_BAND + 1; // interior row 8
+    let base = CREATURE_TOP + CREATURE_BAND + 1; // 8
+
+    // title row: celebration / name / stage
     if celebrating {
-        let pulse_bold = (frame / 4) % 2 == 0;
-        panel!(base, "✦ LEVEL UP! ✦", SPARK, pulse_bold, !pulse_bold);
+        let pulse = (frame / 4) % 2 == 0;
+        panel!(base, "✦ LEVEL UP! ✦", SPARK, pulse, !pulse);
+    } else if let Mode::Naming(b) = mode {
+        panel!(base, format!("name: {b}▏"), CREAM, true, false);
+    } else if let Some(n) = &st.name {
+        panel!(base, n.as_str(), ckey, true, false);
     } else {
         panel!(base, stage.name, ckey, true, false);
     }
-    panel!(base + 1, format!("Lv {lvl}"), CREAM, true, false);
 
-    // xp bar, drawn as filled + empty tracks
+    // level (+ stage when a name occupies the title row)
+    let lvl_line = if st.name.is_some() { format!("Lv {lvl} · {}", stage.name) } else { format!("Lv {lvl}") };
+    panel!(base + 1, lvl_line, CREAM, true, false);
+
+    // hearts + mood, or a transient toast
+    if let Some((msg, _)) = toast {
+        panel!(base + 2, msg.as_str(), SPARK, true, false);
+    } else {
+        let hh = care::hearts(&st, now).min(5) as usize;
+        let hearts = format!("{}{}  {}", "♥".repeat(hh), "♡".repeat(5 - hh), mood.as_str());
+        panel!(base + 2, hearts, if mood.is_needy() { stage.color } else { MUTED }, false, mood == Mood::Sick);
+    }
+
+    // xp bar (per-generation)
+    let (frac, into, span) = gen_progress(total, st.birth_sigma);
     let bar_w = (iw - 6) as usize;
     let filled = (frac * bar_w as f64).round() as usize;
-    let barrow = top + 1 + base + 3;
+    let barrow = top + 1 + base + 4;
     let barcol = left + 1 + 3;
     buf.put(barrow, barcol, &"━".repeat(filled), BAR, true, false);
     buf.put(barrow, barcol + filled as u16, &"━".repeat(bar_w - filled), FAINT, false, false);
-    panel!(
-        base + 4,
-        format!("{} / {} → Lv {}", humanize(into), humanize(span), lvl + 1),
-        MUTED,
-        false,
-        false
-    );
+    panel!(base + 5, format!("{} / {} → Lv {}", humanize(into), humanize(span), lvl + 1), MUTED, false, false);
 
-    panel!(base + 6, format!("Σ {}", humanize(total)), ckey, false, false);
+    // generation + streak
+    let mut meta = format!("Gen {}", st.generation);
+    if st.streak_days > 0 {
+        meta += &format!("   ·   {}d streak", st.streak_days);
+    }
+    panel!(base + 7, meta, MUTED, false, false);
 
-    // footer inset on the bottom border (auto-refreshes every AUTO_REFRESH_SECS)
-    let foot = " [q] quit ";
+    // lifetime Σ
+    panel!(base + 8, format!("Σ {}", humanize(total)), ckey, false, false);
+
+    // footer
+    let foot = " [f]eed [p]et [n]ame [g]rave [q]uit ";
+    buf.put(top + PANEL_H - 1, left + (PANEL_W - char_len(foot)) / 2, foot, MUTED, false, false);
+}
+
+/// Progress within the current generation's level.
+fn gen_progress(total: u64, birth: u64) -> (f64, u64, u64) {
+    progress(total.saturating_sub(birth))
+}
+
+fn compose_graveyard(buf: &mut Buffer, top: u16, left: u16, iw: u16, st: &State) {
+    macro_rules! panel {
+        ($row:expr, $text:expr, $fg:expr, $bold:expr) => {{
+            let t: &str = &$text;
+            let col = left + 1 + iw.saturating_sub(char_len(t)) / 2;
+            buf.put(top + 1 + $row, col, t, $fg, $bold, false);
+        }};
+    }
+    let title = " ❋ GRAVEYARD ❋ ";
+    buf.put(top, left + (PANEL_W - char_len(title)) / 2, title, ACCENT, true, false);
+
+    if st.graveyard.is_empty() {
+        panel!(PANEL_H / 2 - 2, "no graves yet —", MUTED, false);
+        panel!(PANEL_H / 2 - 1, "take good care of it.", MUTED, false);
+    } else {
+        let max_rows = (PANEL_H - 4) as usize;
+        for (i, g) in st.graveyard.iter().rev().take(max_rows).enumerate() {
+            let name = g.name.clone().unwrap_or_else(|| g.stage.clone());
+            let line = format!("† Gen {}  {}  Lv {}", g.generation, name, g.peak_level);
+            panel!(1 + i as u16, line, CREAM, false);
+        }
+    }
+    let foot = " [g]/[q] back ";
     buf.put(top + PANEL_H - 1, left + (PANEL_W - char_len(foot)) / 2, foot, MUTED, false, false);
 }

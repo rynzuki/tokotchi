@@ -1,71 +1,52 @@
-//! `tokotchi level` — the fast, READ-ONLY CLI the statusline calls every render.
+//! `tokotchi level` — the fast, READ-mostly CLI the statusline calls every render.
 //!
-//! Prints "<level>\t<stage>\t<emoji>\t<levelup 0|1>\n". Recomputes the level from the
-//! ledger and flags a level-up for CELEBRATE_SECS after the stored level rises (tracked
-//! in ~/.claude/.tokotchi_state.json). Never scans/writes the ledger — that's TUI-only.
+//! Prints `<level>\t<stage>\t<emoji>\t<levelup>\t<mood>\t<hearts>\t<streak>\t<generation>\n`.
+//! Fields 1–4 are byte-compatible with the pre-care version, so the statusline's `cut -f1/2/4`
+//! is untouched; fields 5–8 are the care layer.
+//!
+//! FIELD OWNERSHIP (see state.rs): this process writes ONLY last_activity, last_seen_sigma,
+//! level, celebrate_until (+ the death transition). It never touches happiness/interaction
+//! fields, so it can't clobber a feed done in the TUI.
 
-use std::fs;
-use std::path::PathBuf;
-
-use serde::{Deserialize, Serialize};
-
-use crate::ledger;
-use crate::model::{level_for, stage_for, CELEBRATE_SECS};
-
-fn state_path() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-        .join(".claude")
-        .join(".tokotchi_state.json")
-}
-
-#[derive(Serialize, Deserialize)]
-struct State {
-    level: u64,
-    celebrate_until: f64,
-}
-
-fn read_state() -> Option<State> {
-    serde_json::from_str(&fs::read_to_string(state_path()).ok()?).ok()
-}
-
-fn write_state(level: u64, celebrate_until: f64) {
-    let path = state_path();
-    let tmp = path.with_extension("json.tmp");
-    let st = State { level, celebrate_until };
-    if let Ok(json) = serde_json::to_string(&st) {
-        if fs::write(&tmp, json).is_ok() {
-            let _ = fs::rename(&tmp, &path);
-        }
-    }
-}
+use crate::model::{level_for_gen, stage_for, CELEBRATE_SECS};
+use crate::{care, ledger, state};
 
 pub fn run() {
     let total = ledger::total(&ledger::read_ledger());
-    let cur = level_for(total);
-    let stage = stage_for(cur);
     let now = ledger::now_secs();
 
-    let celeb = match read_state() {
-        None => {
-            // first ever call — record the level, never celebrate retroactively
-            write_state(cur, 0.0);
-            0.0
+    let st = state::update(now, total, |st| {
+        // token usage refills vitality
+        if total > st.last_seen_sigma {
+            st.last_activity = now;
+            st.last_seen_sigma = total;
         }
-        Some(st) => {
-            if cur > st.level {
-                let c = now + CELEBRATE_SECS;
-                write_state(cur, c);
-                c
-            } else if cur < st.level {
-                write_state(cur, 0.0);
-                0.0
-            } else {
-                // unchanged level → no write; the celeb window (if any) keeps ticking down
-                st.celebrate_until
-            }
+        // death → new generation (idempotent; update re-reads, so this is CAS-safe)
+        care::maybe_reap(st, total, now);
+        // per-generation level + level-up flash
+        let lvl = level_for_gen(total, st.birth_sigma);
+        if lvl > st.level {
+            st.celebrate_until = now + CELEBRATE_SECS;
         }
-    };
+        st.level = lvl;
+        // care streak (credited on day boundaries)
+        care::credit_streak(st, now);
+    });
 
-    let levelup = if now < celeb { 1 } else { 0 };
-    print!("{}\t{}\t{}\t{}\n", cur, stage.name, stage.emoji, levelup);
+    let lvl = st.level;
+    let stage = stage_for(lvl);
+    let levelup = if now < st.celebrate_until { 1 } else { 0 };
+    let mood = care::mood(&st, now);
+    let hearts = care::hearts(&st, now);
+    print!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        lvl,
+        stage.name,
+        stage.emoji,
+        levelup,
+        mood.as_str(),
+        hearts,
+        st.streak_days,
+        st.generation
+    );
 }
