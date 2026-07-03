@@ -16,6 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
 fastrand = "2"
+include_dir = "0.7"   # embed the art/ tree into the binary at compile time
+unicode-width = "0.2" # correct display-width for art alignment/validation
 
 [profile.release]
 opt-level = "z"     # small + fast-to-spawn: `level` runs on every statusline render

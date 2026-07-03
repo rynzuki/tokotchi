@@ -8,11 +8,13 @@ pub const CELEBRATE_SECS: f64 = 45.0;
 pub const CELEBRATE_TUI_SECS: f64 = 8.0;
 pub const AUTO_REFRESH_SECS: u64 = 20; // background ledger re-scan cadence
 
-// Card geometry + creature band (bob/particles stay inside the band; status rows are fixed).
-pub const PANEL_W: u16 = 38;
-pub const PANEL_H: u16 = 20;
-pub const CREATURE_TOP: u16 = 1;
-pub const CREATURE_BAND: u16 = 6;
+// Fixed card geometry — the pet lives in a dedicated terminal tab, so the card NEVER
+// resizes. Creatures of any size bottom-anchor on a shared floor inside the creature box.
+pub const PANEL_W: u16 = 40;
+pub const PANEL_H: u16 = 22;
+pub const CREATURE_TOP: u16 = 1; // interior row where the creature box starts
+pub const BOX_W: u16 = 22; // max creature art width (validated in anim.rs)
+pub const BOX_H: u16 = 8; // creature box height; art may be up to BOX_H-1 tall (leaves a bob row)
 
 // UI chrome colors (256-color indices, identical to the old curses palette).
 pub const ACCENT: u8 = 173; // clay — title + card border
@@ -59,14 +61,23 @@ pub fn humanize(n: u64) -> String {
     }
 }
 
-/// One evolution stage. `frames` = [base, blink, sad]; all 5 lines, matching per-line
-/// widths so blinking / mood changes never reflow the art.
+/// Per-stage ambient sparkle flavor — its own glyphs + spawn rate give each evolution a
+/// distinct feel (dust, bubbles, embers, stars…).
+pub struct Particle {
+    pub glyphs: &'static [char],
+    pub rate: f64, // spawn chance per frame
+}
+
+/// One evolution stage — just metadata now; the art lives in `art/<art_dir>/*.txt`
+/// (see anim.rs). Adding a stage = a new art folder + one entry here.
 pub struct Stage {
     pub min_level: u64,
     pub name: &'static str,
-    pub emoji: &'static str,
-    pub color: u8, // 256-color index; stages ramp warmer as they grow
-    pub frames: [[&'static str; 5]; 3],
+    pub emoji: &'static str, // statusline only
+    pub color: u8,           // primary 256-color index; stages ramp warmer as they grow
+    pub accent: u8,          // secondary tone for flair
+    pub particle: Particle,  // ambient sparkle flavor
+    pub art_dir: &'static str,
 }
 
 // Evolution ramp — pale cream → tan → gold → clay → coral → bright clay.
@@ -76,66 +87,54 @@ pub static STAGES: [Stage; 6] = [
         name: "Egg",
         emoji: "🥚",
         color: 223,
-        frames: [
-            ["  ___ ", " /   \\", "|     |", "|     |", " \\___/"],
-            ["  ___ ", " /   \\", "| . . |", "|     |", " \\___/"],
-            ["  ___ ", " /   \\", "| u u |", "|     |", " \\___/"],
-        ],
+        accent: 179,
+        particle: Particle { glyphs: &['·', '.'], rate: 0.10 },
+        art_dir: "egg",
     },
     Stage {
         min_level: 5,
         name: "Blob",
         emoji: "👾",
         color: 180,
-        frames: [
-            [" _____ ", "/     \\", "| o o |", "|  ω  |", "\\_____/"],
-            [" _____ ", "/     \\", "| - - |", "|  ω  |", "\\_____/"],
-            [" _____ ", "/     \\", "| u u |", "|  ω  |", "\\_____/"],
-        ],
+        accent: 179,
+        particle: Particle { glyphs: &['°', '∘', '·'], rate: 0.16 },
+        art_dir: "blob",
     },
     Stage {
         min_level: 15,
         name: "Sprout",
         emoji: "🌱",
         color: 179,
-        frames: [
-            ["   ,   ", "  (|)  ", " /o o\\ ", "( \\_/ )", " \\___/ "],
-            ["   ,   ", "  (|)  ", " /- -\\ ", "( \\_/ )", " \\___/ "],
-            ["   ,   ", "  (|)  ", " /u u\\ ", "( \\_/ )", " \\___/ "],
-        ],
+        accent: 108,
+        particle: Particle { glyphs: &['·', ',', '˙'], rate: 0.18 },
+        art_dir: "sprout",
     },
     Stage {
         min_level: 30,
         name: "Critter",
         emoji: "🐱",
         color: 173,
-        frames: [
-            [" /\\_/\\ ", "( o.o )", " > ^ < ", "/|   |\\", " |___| "],
-            [" /\\_/\\ ", "( -.- )", " > ^ < ", "/|   |\\", " |___| "],
-            [" /\\_/\\ ", "( ;.; )", " > _ < ", "/|   |\\", " |___| "],
-        ],
+        accent: 209,
+        particle: Particle { glyphs: &['·', '✦', '✧', '⋆'], rate: 0.22 },
+        art_dir: "critter",
     },
     Stage {
         min_level: 60,
         name: "Beast",
         emoji: "🐉",
         color: 209,
-        frames: [
-            ["  __/\\__  ", " ( o  o ) ", "<   VV   >", " \\ ~~~~ / ", " /|    |\\ "],
-            ["  __/\\__  ", " ( -  - ) ", "<   VV   >", " \\ ~~~~ / ", " /|    |\\ "],
-            ["  __/\\__  ", " ( u  u ) ", "<   ~~   >", " \\ ~~~~ / ", " /|    |\\ "],
-        ],
+        accent: 215,
+        particle: Particle { glyphs: &['·', '˙', '*', '✦'], rate: 0.26 },
+        art_dir: "beast",
     },
     Stage {
         min_level: 100,
         name: "Elder",
         emoji: "👑",
         color: 215,
-        frames: [
-            ["✦  __/\\__  ✦", "  ( ◕  ◕ )  ", " <   WW   > ", "✦ \\ ~~~~ / ✦", "  /|    |\\  "],
-            ["✦  __/\\__  ✦", "  ( ─  ─ )  ", " <   WW   > ", "✦ \\ ~~~~ / ✦", "  /|    |\\  "],
-            ["✦  __/\\__  ✦", "  ( u  u )  ", " <   ~~   > ", "✦ \\ ~~~~ / ✦", "  /|    |\\  "],
-        ],
+        accent: 230,
+        particle: Particle { glyphs: &['✦', '✧', '⋆', '✳', '·'], rate: 0.30 },
+        art_dir: "elder",
     },
 ];
 
@@ -192,19 +191,6 @@ mod tests {
         assert_eq!(stage_for(5).name, "Blob");
         assert_eq!(stage_for(49).name, "Critter");
         assert_eq!(stage_for(250).name, "Elder");
-    }
-
-    #[test]
-    fn alt_frames_match_base_per_line() {
-        // Art lines are intentionally ragged-width (each is centered independently), but the
-        // blink (1) and sad (2) frames must match base (0) line-for-line so nothing reflows.
-        for st in STAGES.iter() {
-            for alt in [1usize, 2] {
-                for (a, b) in st.frames[0].iter().zip(st.frames[alt].iter()) {
-                    assert_eq!(a.chars().count(), b.chars().count(), "stage {} frame {alt} reflows", st.name);
-                }
-            }
-        }
     }
 
     #[test]

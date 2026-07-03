@@ -2,6 +2,7 @@
 //! ledger scan and pet model directly. The `tokotchi` binary (src/main.rs) is a thin
 //! CLI over these modules.
 
+pub mod anim;
 pub mod care;
 pub mod ledger;
 pub mod level_cli;

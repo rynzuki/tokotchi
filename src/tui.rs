@@ -13,6 +13,7 @@ use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetFor
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 
+use crate::anim::{self, ClipKind};
 use crate::care::{self, CareResult, Mood};
 use crate::model::*;
 use crate::state::{self, State};
@@ -127,10 +128,17 @@ pub fn run() {
 
 fn latest_src_mtime() -> Option<std::time::SystemTime> {
     let mut latest: Option<std::time::SystemTime> = None;
-    for entry in std::fs::read_dir("src").ok()?.flatten() {
-        if entry.path().extension().and_then(|e| e.to_str()) == Some("rs") {
-            if let Ok(m) = entry.metadata().and_then(|md| md.modified()) {
-                latest = Some(latest.map_or(m, |l| l.max(m)));
+    // watch both Rust source and the art tree so editing either triggers a dev reload
+    for dir in ["src", "art"] {
+        for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+            let ext = entry.path().extension().and_then(|e| e.to_str());
+            if !matches!(ext, Some("rs") | Some("txt")) {
+                continue;
+            }
+            if let Ok(md) = entry.metadata() {
+                if let Ok(m) = md.modified() {
+                    latest = Some(latest.map_or(m, |l: std::time::SystemTime| l.max(m)));
+                }
             }
         }
     }
@@ -151,6 +159,7 @@ fn run_ui() -> io::Result<bool> {
     let mut frame: u64 = 0;
     let mut mode = Mode::Normal;
     let mut toast: Option<(String, f64)> = None;
+    let mut happy_until = 0.0f64; // plays the Happy clip briefly after a feed/pet
 
     let (mut w, mut h) = terminal::size()?;
     execute!(out, Clear(ClearType::All))?;
@@ -178,14 +187,14 @@ fn run_ui() -> io::Result<bool> {
         }
 
         back.clear();
-        compose(&mut back, &shared, &mut particles, frame, &mode, &toast, now);
+        compose(&mut back, &shared, &mut particles, frame, &mode, &toast, now < happy_until, now);
         flush_diff(&mut out, &mut front, &back)?;
         frame = frame.wrapping_add(1);
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(k) => {
-                    if handle_key(k.code, &mut mode, &shared, &mut toast) {
+                    if handle_key(k.code, &mut mode, &shared, &mut toast, &mut happy_until) {
                         return Ok(false); // quit
                     }
                 }
@@ -205,7 +214,13 @@ fn run_ui() -> io::Result<bool> {
 }
 
 /// Returns true if the app should quit.
-fn handle_key(code: KeyCode, mode: &mut Mode, shared: &Mutex<Shared>, toast: &mut Option<(String, f64)>) -> bool {
+fn handle_key(
+    code: KeyCode,
+    mode: &mut Mode,
+    shared: &Mutex<Shared>,
+    toast: &mut Option<(String, f64)>,
+    happy_until: &mut f64,
+) -> bool {
     let now = ledger::now_secs();
     match mode {
         Mode::Naming(buf) => match code {
@@ -231,8 +246,8 @@ fn handle_key(code: KeyCode, mode: &mut Mode, shared: &Mutex<Shared>, toast: &mu
         },
         Mode::Normal => match code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return true,
-            KeyCode::Char('f') => interact(shared, toast, now, care::feed, "*nom*  ♥", "already fed…"),
-            KeyCode::Char('p') => interact(shared, toast, now, care::pet, "♥", "still purring…"),
+            KeyCode::Char('f') => interact(shared, toast, happy_until, now, care::feed, "*nom*  ♥", "already fed…"),
+            KeyCode::Char('p') => interact(shared, toast, happy_until, now, care::pet, "♥", "still purring…"),
             KeyCode::Char('n') => {
                 let cur = shared.lock().unwrap().st.name.clone().unwrap_or_default();
                 *mode = Mode::Naming(cur);
@@ -244,9 +259,11 @@ fn handle_key(code: KeyCode, mode: &mut Mode, shared: &Mutex<Shared>, toast: &mu
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interact(
     shared: &Mutex<Shared>,
     toast: &mut Option<(String, f64)>,
+    happy_until: &mut f64,
     now: f64,
     action: fn(&mut State, f64) -> CareResult,
     ok_msg: &str,
@@ -256,8 +273,11 @@ fn interact(
     let mut res = CareResult::Cooldown;
     let st = state::update(now, total, |s| res = action(s, now));
     shared.lock().unwrap().st = st;
-    let msg = if res == CareResult::Done { ok_msg } else { cd_msg };
-    *toast = Some((msg.to_string(), now + 1.6));
+    let done = res == CareResult::Done;
+    if done {
+        *happy_until = now + 1.6; // play the Happy clip while the reaction shows
+    }
+    *toast = Some(((if done { ok_msg } else { cd_msg }).to_string(), now + 1.6));
 }
 
 fn flush_diff(out: &mut impl Write, front: &mut Buffer, back: &Buffer) -> io::Result<()> {
@@ -313,17 +333,19 @@ fn do_refresh(shared: &Mutex<Shared>) {
 }
 
 // ── particles ────────────────────────────────────────────────────────────────
-fn step_particles(ps: &mut Vec<Particle>, band_rows: i32, iw: i32, celebrating: bool) {
+fn step_particles(ps: &mut Vec<Particle>, band_rows: i32, iw: i32, glyphs: &[char], rate: f64, celebrating: bool) {
     for p in ps.iter_mut() {
         p.age += 1;
     }
     ps.retain(|p| p.age < p.ttl);
-    let (chance, cap) = if celebrating { (0.85, 26) } else { (0.22, 10) };
-    if (ps.len() as i32) < cap && fastrand::f64() < chance {
+    // celebration overrides the stage flavor with a denser gold sparkle burst
+    let (chance, cap, set): (f64, i32, &[char]) =
+        if celebrating { (0.85, 26, &SPARKLE_CHARS) } else { (rate, 10, glyphs) };
+    if (ps.len() as i32) < cap && fastrand::f64() < chance && !set.is_empty() {
         ps.push(Particle {
             row: fastrand::i32(0..=band_rows),
             col: fastrand::i32(0..iw),
-            ch: SPARKLE_CHARS[fastrand::usize(0..SPARKLE_CHARS.len())],
+            ch: set[fastrand::usize(0..set.len())],
             age: 0,
             ttl: fastrand::i32(10..=22),
         });
@@ -345,6 +367,7 @@ fn draw_box(buf: &mut Buffer, top: u16, left: u16, ph: u16, pw: u16, fg: u8) {
     buf.put(top + ph - 1, left, &format!("╰{dashes}╯"), fg, false, false);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compose(
     buf: &mut Buffer,
     shared: &Mutex<Shared>,
@@ -352,6 +375,7 @@ fn compose(
     frame: u64,
     mode: &Mode,
     toast: &Option<(String, f64)>,
+    happy: bool,
     now: f64,
 ) {
     let (w, h) = (buf.w, buf.h);
@@ -362,7 +386,7 @@ fn compose(
 
     // too small for the card → compact one-liner
     if h < PANEL_H + 1 || w < PANEL_W + 1 {
-        let line = format!("Tokotchi · Lv {} · Σ {}  (resize)", st.level, humanize(total));
+        let line = format!("Tokotchi · Lv {} · Σ {}  (resize)", st.level, humanize(total.saturating_sub(st.birth_sigma)));
         buf.put(0, 0, &line, ACCENT, false, false);
         return;
     }
@@ -393,11 +417,19 @@ fn compose(
     let stage = stage_for(lvl);
     let mood = care::mood(&st, now);
     let celebrating = now < st.celebrate_until;
+    let blink = (frame % 36) < 2;
     let ckey = if mood == Mood::Sick { MUTED } else { stage.color };
 
-    // sparkles behind the creature
-    step_particles(particles, (CREATURE_TOP + CREATURE_BAND) as i32, iw as i32, celebrating);
-    let spark_fg = if celebrating { SPARK } else { ckey };
+    // ambient sparkles (per-stage flavor) behind the creature
+    step_particles(
+        particles,
+        (CREATURE_TOP + BOX_H) as i32,
+        iw as i32,
+        stage.particle.glyphs,
+        stage.particle.rate,
+        celebrating,
+    );
+    let spark_fg = if celebrating { SPARK } else { stage.accent };
     let mut chbuf = [0u8; 4];
     for p in particles.iter() {
         let phase = p.age as f64 / p.ttl as f64;
@@ -405,22 +437,28 @@ fn compose(
         buf.put(top + 1 + p.row as u16, left + 1 + p.col as u16, p.ch.encode_utf8(&mut chbuf), spark_fg, b, d);
     }
 
-    // creature — mood picks the face; bob stays in the band
-    let blink = (frame % 36) < 2;
-    let art = if mood.is_down() {
-        if blink { &stage.frames[1] } else { &stage.frames[2] }
+    // creature — resolve the clip from mood/events, draw bottom-anchored + centered in the box
+    let kind = if celebrating {
+        ClipKind::Celebrate
+    } else if happy {
+        ClipKind::Happy
+    } else if mood.is_down() {
+        ClipKind::Sad
     } else if blink {
-        &stage.frames[1]
+        ClipKind::Blink
     } else {
-        &stage.frames[0]
+        ClipKind::Idle
     };
+    let f = anim::frame_at(anim::sprite(stage.art_dir).clip(kind), frame);
     let bob: u16 = if (frame / 7) % 2 == 0 { 1 } else { 0 };
     let glow = (stage.name == "Elder" && mood != Mood::Sick) || celebrating;
-    for (i, line) in art.iter().enumerate() {
-        panel!(CREATURE_TOP + bob + i as u16, line, ckey, glow, false);
+    let art_top = CREATURE_TOP + BOX_H.saturating_sub(f.h).saturating_sub(bob); // grounded, hops on bob
+    let art_left = left + 1 + iw.saturating_sub(f.w) / 2; // horizontally centered
+    for (i, line) in f.lines.iter().enumerate() {
+        buf.put(top + 1 + art_top + i as u16, art_left, line, ckey, glow, false);
     }
 
-    let base = CREATURE_TOP + CREATURE_BAND + 1; // 8
+    let base = CREATURE_TOP + BOX_H + 1; // status block starts just below the box
 
     // title row: celebration / name / stage
     if celebrating {
@@ -464,8 +502,8 @@ fn compose(
     }
     panel!(base + 7, meta, MUTED, false, false);
 
-    // lifetime Σ
-    panel!(base + 8, format!("Σ {}", humanize(total)), ckey, false, false);
+    // per-generation Σ (the lifetime total is available in the statusline / wasted-on-claude)
+    panel!(base + 8, format!("Σ {}", humanize(total.saturating_sub(st.birth_sigma))), ckey, false, false);
 
     // footer
     let foot = " [f]eed [p]et [n]ame [g]rave [q]uit ";
