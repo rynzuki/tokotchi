@@ -14,11 +14,11 @@ A collectible terminal pet that levels up off the tokens you spend on [Claude Co
         │          Critter           │
         │           Lv 48            │
         │                            │
-        │    ━━━━━━━━━━━━━━━━━━━      │
+        │    ━━━━━━━━━━━━━━━━━━━     │
         │    5.4M / 97.0M → Lv 49    │
         │                            │
         │          Σ 2.31B           │
-        ╰──── [r] refresh · [q] quit ─╯
+        ╰─── [r] refresh · [q] quit ─╯
 ```
 
 > _Replace this ASCII sketch with a real screen recording — see [Demo](#demo)._
