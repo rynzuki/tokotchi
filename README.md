@@ -4,27 +4,7 @@ A collectible terminal pet that grows off the tokens you spend on [Claude Code](
 
 A single, dependency-free binary: no Python, no `curses`, no `jq`. It scans your Claude Code transcripts itself and keeps its own token tally.
 
-```
-        ╭──────────── ❋ TOKOTCHI ❋ ────────────╮
-        │              ✧          ✦             │
-        │                 /\_/\                 │
-        │                ( o.o )              ⋆ │
-        │                 > ^ <                 │
-        │                /|   |\                │
-        │                 |___|                 │
-        │                                       │
-        │                 Niclas                │
-        │            Lv 50 · Critter            │
-        │             ♥♥♥♥♥  happy              │
-        │                                       │
-        │    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━     │
-        │         51.3M / 101.0M → Lv 51        │
-        │                                       │
-        │                 Gen 1                 │
-        │                Σ 2.55B                │
-        │                                       │
-        ╰─ [f]eed [p]et [n]ame [g]rave [q]uit ──╯
-```
+![tokotchi demo](docs/demo.gif)
 
 ## Install
 
