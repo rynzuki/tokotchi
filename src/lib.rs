@@ -6,6 +6,7 @@ pub mod anim;
 pub mod care;
 pub mod ledger;
 pub mod level_cli;
+pub mod mode;
 pub mod model;
 pub mod state;
 pub mod tui;

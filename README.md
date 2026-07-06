@@ -67,6 +67,20 @@ Evolution is gated by level:
 
 Each stage has its own art, colour, and ambient sparkle flavor, and warms toward full Claude-clay as it grows.
 
+## Counting modes (plan-aware)
+
+"Tokens spent" means different things depending on how you pay for Claude, so Σ is weighted for your plan — auto-detected from `~/.claude.json`:
+
+| Mode | Σ counts | Auto-selected when |
+|---|---|---|
+| **subscription** | `input + output` (content only) | You're on a Pro/Max plan — metered by rate-limit windows, so cache reads shouldn't inflate the count |
+| **api** | `input + output + 1.25·cache_creation + 0.1·cache_read` | You use an API key / console org — cache-discounted, input-equivalent cost |
+| **raw** | everything, incl. cache reads | Legacy / fallback — the pre-modes count (cache reads dominate it) |
+
+Detection runs on **every render** — order: `TOKOTCHI_MODE` env → a set `ANTHROPIC_API_KEY` → your plan in `~/.claude.json` → `raw` fallback — so changing plans re-levels the pet on its own. Force a lens with `TOKOTCHI_MODE=subscription|api|raw` (or `auto`, the default).
+
+Each mode is an independent **level lens** over the *same* pet: switching re-levels but never forks a second creature, deaths happen once (drought-driven, not per-mode), and every mode keeps its own level lineage — so the `raw` view still shows a pet you grew before modes existed. `tokotchi sigma [SESSION_ID]` prints the active mode's Σ (or one session's Δ).
+
 ## Care, mood & mortality
 
 Hybrid, and deliberately low-stress:
@@ -91,14 +105,14 @@ lvl=$(printf '%s' "$tok" | cut -f1); name=$(printf '%s' "$tok" | cut -f2)
 printf 'Lv %s (%s)' "$lvl" "$name"
 ```
 
-The statusline snippet is a shell one-liner (macOS/Linux/WSL). The `tokotchi` binary itself is cross-platform.
+`tokotchi sigma` prints the active mode's all-time Σ; `tokotchi sigma <session-id>` prints one session's Δ; `tokotchi refresh` re-scans transcripts into the ledger (run it in the background on a TTL). The statusline snippet is a shell one-liner (macOS/Linux/WSL). The `tokotchi` binary itself is cross-platform.
 
 ## Your data
 
-Two files under `~/.claude/` (`%USERPROFILE%\.claude` on Windows), independent of where the binary is installed — so they **survive reinstalling/upgrading tokotchi**:
+Two files under `~/.claude/` (`%USERPROFILE%\.claude` on Windows), independent of where the binary is installed — so they **survive reinstalling/upgrading tokotchi**. tokotchi is their sole owner:
 
-- `.token_ledger.json` — per-session token tally (prune-proof; survives transcript pruning).
-- `.tokotchi_state.json` — your pet: generation, name, happiness, streak, graveyard. Schema changes are migrated, never wiped.
+- `.token_ledger.json` — per-session token components (input/output/cache), prune-proof so the tally survives transcript pruning. Weighted into Σ per the active counting mode.
+- `.tokotchi_state.json` — your pet: generation, name, happiness, streak, graveyard, and a per-mode level lineage. Schema changes are migrated, never wiped.
 
 ## Art & animation
 
@@ -125,6 +139,7 @@ Clips: `idle` (required), `blink`, `sad`, `happy`, `celebrate`. To add an animat
 | `[` / `]` | jump to the previous / next evolution stage |
 | `+` / `-` | level ± 1 |
 | `c` | play the level-up celebration |
+| `m` | cycle the counting mode (raw → subscription → api) to preview each lens live |
 | `r` | reset all overrides back to the real pet |
 | `k` | **kill** — a real death (records the graveyard, hatches a new egg) |
 | `d` / `Esc` / `q` | close the panel |

@@ -6,7 +6,7 @@
 //! a user generating tokens keeps vitality pinned at full; death needs a ~10-day drought.
 
 use crate::model::stage_for;
-use crate::state::{Grave, State};
+use crate::state::{Economy, Grave, State};
 
 const DAY: f64 = 86400.0;
 
@@ -128,11 +128,13 @@ pub fn pet(st: &mut State, now: f64) -> CareResult {
     CareResult::Done
 }
 
-/// If the pet has died (vitality 0), record it in the graveyard and hatch a new generation
-/// whose level counts only tokens from now on (`birth_sigma = sigma`). Returns whether a
-/// death happened. Idempotent by construction: after this the pet is a fresh living gen, so a
-/// second observer sees vitality > 0 and does nothing (see the CAS note in state::update).
-pub fn maybe_reap(st: &mut State, sigma: u64, now: f64) -> bool {
+/// If the pet has died (vitality 0), record it in the graveyard and hatch a new generation.
+/// Death is GLOBAL (drought-driven), so it resets the global identity/care once; the active
+/// mode's `eco` becomes a fresh gen-2 egg (`birth_sigma = sigma`), and the other modes'
+/// economies re-grandfather lazily when next activated (they'll see `gen_stamp` lag the new
+/// generation). Returns whether a death happened. Idempotent by construction: afterwards the
+/// pet is a fresh living gen, so a second observer sees vitality > 0 and does nothing.
+pub fn maybe_reap(st: &mut State, eco: &mut Economy, sigma: u64, now: f64) -> bool {
     if vitality(st, now) > 0.0 {
         return false;
     }
@@ -141,27 +143,30 @@ pub fn maybe_reap(st: &mut State, sigma: u64, now: f64) -> bool {
     st.graveyard.push(Grave {
         name: st.name.clone(),
         generation: st.generation,
-        stage: stage_for(st.level).name.to_string(),
-        peak_level: st.level, // per-gen level is monotonic, so current == peak
+        stage: stage_for(eco.level).name.to_string(),
+        peak_level: eco.level, // per-gen level is monotonic, so current == peak
         born_at: st.born_at,
         died_at,
     });
 
     st.generation += 1;
-    st.birth_sigma = sigma;
     st.born_at = now;
     st.name = None;
     st.happiness = 100.0;
     st.happiness_at = now;
     st.last_activity = now;
-    st.last_seen_sigma = sigma;
     st.fed_until = 0.0;
     st.last_fed = 0.0;
     st.last_pet = 0.0;
-    st.level = 1;
-    st.celebrate_until = 0.0;
     st.streak_days = 0;
     st.last_streak_day = (now / DAY) as i64;
+    *eco = Economy {
+        gen_stamp: st.generation,
+        birth_sigma: sigma,
+        last_seen_sigma: sigma,
+        level: 1,
+        celebrate_until: 0.0,
+    };
     true
 }
 
@@ -187,10 +192,11 @@ pub fn credit_streak(st: &mut State, now: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mode::CountMode;
     use crate::state::migrate_parsed;
 
     fn fresh(now: f64, sigma: u64) -> State {
-        migrate_parsed(None, now, sigma).0
+        migrate_parsed(None, now, sigma, CountMode::Raw).0
     }
 
     #[test]
@@ -250,22 +256,24 @@ mod tests {
     fn reap_starts_new_generation_from_death_sigma() {
         let now = 100.0 * DAY;
         let mut st = fresh(now, 2_400_000_000);
+        let mut eco = st.by_mode.remove(&CountMode::Raw).unwrap();
         st.name = Some("Critter".into());
-        st.level = 49;
+        eco.level = 49;
         st.last_activity = now - 11.0 * DAY; // dead
         st.fed_until = 0.0;
 
-        assert!(maybe_reap(&mut st, 2_400_000_000, now));
+        assert!(maybe_reap(&mut st, &mut eco, 2_400_000_000, now));
         assert_eq!(st.generation, 2);
-        assert_eq!(st.birth_sigma, 2_400_000_000); // gen 2 counts tokens from death onward
-        assert_eq!(st.level, 1);
+        assert_eq!(eco.birth_sigma, 2_400_000_000); // gen 2 counts tokens from death onward
+        assert_eq!(eco.level, 1);
+        assert_eq!(eco.gen_stamp, 2);
         assert!(st.name.is_none());
         assert_eq!(st.graveyard.len(), 1);
         assert_eq!(st.graveyard[0].name.as_deref(), Some("Critter"));
         assert_eq!(st.graveyard[0].peak_level, 49);
         assert_eq!(st.graveyard[0].generation, 1);
         // second reap is a no-op (fresh pet is alive)
-        assert!(!maybe_reap(&mut st, 2_400_000_000, now));
+        assert!(!maybe_reap(&mut st, &mut eco, 2_400_000_000, now));
         assert_eq!(st.graveyard.len(), 1);
     }
 }

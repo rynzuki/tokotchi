@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use tokotchi::ledger;
+use tokotchi::mode::CountMode;
 
 fn tmp(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("tokotchi_{}_{}", tag, std::process::id()))
@@ -47,9 +48,12 @@ fn scan_fixture() {
     fs::write(a.join("notes.txt"), "ignore me").unwrap();
 
     let scan = ledger::scan_dir(&root);
-    assert_eq!(scan.get("s1"), Some(&25)); // (10+5) + (1+2+3) + 4
-    assert_eq!(scan.get("s2"), Some(&100));
-    assert_eq!(ledger::total(&scan), 125);
+    // Raw weight == the old flat four-field sum, so parity numbers are unchanged.
+    assert_eq!(ledger::session_total(&scan, "s1", CountMode::Raw), 25); // (10+5) + (1+2+3) + 4
+    assert_eq!(ledger::session_total(&scan, "s2", CountMode::Raw), 100);
+    assert_eq!(ledger::total(&scan, CountMode::Raw), 125);
+    // Subscription drops cache: s1 content = 10+5+1 = 16, s2 = 100 → 116
+    assert_eq!(ledger::total(&scan, CountMode::Subscription), 116);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -97,7 +101,8 @@ fn scan_matches_jq_on_real_data() {
     let out = Command::new("sh").arg("-c").arg(&sh).output().unwrap();
     let jq_total: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
 
-    let rust_total: u64 = ledger::scan_dir(&snap_projects).values().sum();
+    // Raw weight over a fresh scan == the jq four-field sum (no legacy carryover here).
+    let rust_total: u64 = ledger::total(&ledger::scan_dir(&snap_projects), CountMode::Raw);
 
     let _ = fs::remove_dir_all(&snap);
     assert_eq!(rust_total, jq_total, "Rust scan ({rust_total}) != jq scan ({jq_total})");

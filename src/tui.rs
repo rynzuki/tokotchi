@@ -16,7 +16,8 @@ use crossterm::{execute, queue};
 use crate::anim::{self, ClipKind};
 use crate::care::{self, CareResult, Mood};
 use crate::model::*;
-use crate::state::{self, State};
+use crate::mode::CountMode;
+use crate::state::{self, Economy, State};
 use crate::ledger;
 
 const NEED_TTY: &str = "\
@@ -34,8 +35,10 @@ const RELOAD_EXIT_CODE: i32 = 69;
 const NAME_MAX: usize = 12;
 
 struct Shared {
-    total: u64,
-    st: State,
+    total: u64,     // Σ under the active mode
+    st: State,      // global identity + care
+    eco: Economy,   // active mode's level lens
+    mode: CountMode,
 }
 
 struct Particle {
@@ -160,9 +163,11 @@ fn run_ui() -> io::Result<bool> {
     let _guard = TermGuard::enter()?;
 
     let now = ledger::now_secs();
-    let total = ledger::total(&ledger::read_ledger());
-    let st = state::load_or_migrate(now, total).0;
-    let shared = Arc::new(Mutex::new(Shared { total, st }));
+    let mode = crate::mode::detect();
+    let total = ledger::total(&ledger::read_ledger(), mode);
+    let st = state::load_or_migrate(now, total, mode).0;
+    let eco = st.by_mode.get(&mode).cloned().unwrap_or_default();
+    let shared = Arc::new(Mutex::new(Shared { total, st, eco, mode }));
     spawn_refresh(Arc::clone(&shared));
 
     let mut out = io::stdout();
@@ -243,11 +248,15 @@ fn handle_key(
         Mode::Naming(buf) => match code {
             KeyCode::Enter => {
                 let name = buf.trim().to_string();
-                let total = shared.lock().unwrap().total;
-                let st = state::update(now, total, |s| {
+                let (total, m) = { let sh = shared.lock().unwrap(); (sh.total, sh.mode) };
+                let (st, eco) = state::update(now, total, m, |s, _eco| {
                     s.name = if name.is_empty() { None } else { Some(name.clone()) };
                 });
-                shared.lock().unwrap().st = st;
+                {
+                    let mut sh = shared.lock().unwrap();
+                    sh.st = st;
+                    sh.eco = eco;
+                }
                 *mode = Mode::Normal;
             }
             KeyCode::Esc => *mode = Mode::Normal,
@@ -285,16 +294,21 @@ fn handle_key(
             KeyCode::Char('+') | KeyCode::Char('=') => dev_ov.level = Some(cur_level(shared, dev_ov).saturating_add(1)),
             KeyCode::Char('-') => dev_ov.level = Some(cur_level(shared, dev_ov).saturating_sub(1).max(1)),
             KeyCode::Char('c') => dev_ov.celebrate_until = now + CELEBRATE_TUI_SECS,
+            KeyCode::Char('m') => cycle_mode(shared, now), // preview the next counting mode's lens
             KeyCode::Char('r') => *dev_ov = Dev::default(),
             KeyCode::Char('k') => {
                 // the one real action: force vitality to 0 and run the actual death path
-                let total = shared.lock().unwrap().total;
-                let st = state::update(now, total, |s| {
+                let (total, m) = { let sh = shared.lock().unwrap(); (sh.total, sh.mode) };
+                let (st, eco) = state::update(now, total, m, |s, e| {
                     s.last_activity = now - (care::DEATH_DAYS + 1.0) * 86_400.0;
                     s.fed_until = 0.0;
-                    care::maybe_reap(s, total, now);
+                    care::maybe_reap(s, e, total, now);
                 });
-                shared.lock().unwrap().st = st;
+                {
+                    let mut sh = shared.lock().unwrap();
+                    sh.st = st;
+                    sh.eco = eco;
+                }
                 *dev_ov = Dev::default();
             }
             _ => {}
@@ -305,7 +319,22 @@ fn handle_key(
 
 /// The level the dev panel is currently acting on (override if set, else the real level).
 fn cur_level(shared: &Mutex<Shared>, dev_ov: &Dev) -> u64 {
-    dev_ov.level.unwrap_or_else(|| shared.lock().unwrap().st.level)
+    dev_ov.level.unwrap_or_else(|| shared.lock().unwrap().eco.level)
+}
+
+/// Dev-only: switch the active counting mode (raw → sub → api → raw) and re-resolve the
+/// pet's economy for it, so you can eyeball each lens live. Persists the newly-activated
+/// economy (harmless — it's the same real pet, just viewed differently).
+fn cycle_mode(shared: &Mutex<Shared>, now: f64) {
+    let new_mode = { shared.lock().unwrap().mode.next() };
+    let total = ledger::total(&ledger::read_ledger(), new_mode);
+    let (st, _) = state::load_or_migrate(now, total, new_mode);
+    let eco = st.by_mode.get(&new_mode).cloned().unwrap_or_default();
+    let mut sh = shared.lock().unwrap();
+    sh.mode = new_mode;
+    sh.total = total;
+    sh.st = st;
+    sh.eco = eco;
 }
 
 /// Step to the previous/next evolution stage's entry level (for `[` / `]`).
@@ -325,10 +354,14 @@ fn interact(
     ok_msg: &str,
     cd_msg: &str,
 ) {
-    let total = shared.lock().unwrap().total;
+    let (total, m) = { let sh = shared.lock().unwrap(); (sh.total, sh.mode) };
     let mut res = CareResult::Cooldown;
-    let st = state::update(now, total, |s| res = action(s, now));
-    shared.lock().unwrap().st = st;
+    let (st, eco) = state::update(now, total, m, |s, _eco| res = action(s, now));
+    {
+        let mut sh = shared.lock().unwrap();
+        sh.st = st;
+        sh.eco = eco;
+    }
     let done = res == CareResult::Done;
     if done {
         *happy_until = now + 1.6; // play the Happy clip while the reaction shows
@@ -368,24 +401,26 @@ fn spawn_refresh(shared: Arc<Mutex<Shared>>) {
 
 fn do_refresh(shared: &Mutex<Shared>) {
     let now = ledger::now_secs();
-    let total = ledger::total(&ledger::refresh());
+    let mode = { shared.lock().unwrap().mode };
+    let total = ledger::total(&ledger::refresh(), mode);
     // same owned-field updates as `tokotchi level`, so the pet lives/grows while the TUI is open
-    let st = state::update(now, total, |s| {
-        if total > s.last_seen_sigma {
+    let (st, eco) = state::update(now, total, mode, |s, e| {
+        if total > e.last_seen_sigma {
             s.last_activity = now;
-            s.last_seen_sigma = total;
+            e.last_seen_sigma = total;
         }
-        care::maybe_reap(s, total, now);
-        let lvl = level_for_gen(total, s.birth_sigma);
-        if lvl > s.level {
-            s.celebrate_until = now + CELEBRATE_TUI_SECS;
+        care::maybe_reap(s, e, total, now);
+        let lvl = level_for_gen(total, e.birth_sigma);
+        if lvl > e.level {
+            e.celebrate_until = now + CELEBRATE_TUI_SECS;
         }
-        s.level = lvl;
+        e.level = lvl;
         care::credit_streak(s, now);
     });
     let mut sh = shared.lock().unwrap();
     sh.total = total;
     sh.st = st;
+    sh.eco = eco;
 }
 
 // ── particles ────────────────────────────────────────────────────────────────
@@ -436,14 +471,14 @@ fn compose(
     now: f64,
 ) {
     let (w, h) = (buf.w, buf.h);
-    let (total, st) = {
+    let (total, st, eco, active_mode) = {
         let s = shared.lock().unwrap();
-        (s.total, s.st.clone())
+        (s.total, s.st.clone(), s.eco.clone(), s.mode)
     };
 
     // too small for the card → compact one-liner
     if h < PANEL_H + 1 || w < PANEL_W + 1 {
-        let line = format!("Tokotchi · Lv {} · Σ {}  (resize)", st.level, humanize(total.saturating_sub(st.birth_sigma)));
+        let line = format!("Tokotchi · Lv {} · Σ {}  (resize)", eco.level, humanize(total.saturating_sub(eco.birth_sigma)));
         buf.put(0, 0, &line, ACCENT, false, false);
         return;
     }
@@ -468,14 +503,15 @@ fn compose(
     }
 
     let in_dev = matches!(mode, Mode::Dev);
-    let title = if in_dev { " ⚙ DEV ⚙ " } else { " ❋ TOKOTCHI ❋ " };
+    let dev_title = format!(" ⚙ DEV·{} ⚙ ", active_mode.label());
+    let title: &str = if in_dev { &dev_title } else { " ❋ TOKOTCHI ❋ " };
     buf.put(top, left + (PANEL_W - char_len(title)) / 2, title, ACCENT, true, false);
 
     // dev overrides (all None/0 in a shipped binary → identical to normal rendering)
-    let lvl = dev.level.unwrap_or(st.level);
+    let lvl = dev.level.unwrap_or(eco.level);
     let stage = stage_for(lvl);
     let mood = dev.mood.unwrap_or_else(|| care::mood(&st, now));
-    let celebrating = now < st.celebrate_until.max(dev.celebrate_until);
+    let celebrating = now < eco.celebrate_until.max(dev.celebrate_until);
     let blink = (frame % 36) < 2;
     let ckey = if mood == Mood::Sick { MUTED } else { stage.color };
 
@@ -545,7 +581,7 @@ fn compose(
     }
 
     // xp bar (per-generation)
-    let (frac, into, span) = gen_progress(total, st.birth_sigma);
+    let (frac, into, span) = gen_progress(total, eco.birth_sigma);
     let bar_w = (iw - 6) as usize;
     let filled = (frac * bar_w as f64).round() as usize;
     let barrow = top + 1 + base + 4;
@@ -562,11 +598,11 @@ fn compose(
     panel!(base + 7, meta, MUTED, false, false);
 
     // per-generation Σ (the lifetime total is available in the statusline / wasted-on-claude)
-    panel!(base + 8, format!("Σ {}", humanize(total.saturating_sub(st.birth_sigma))), ckey, false, false);
+    panel!(base + 8, format!("Σ {}", humanize(total.saturating_sub(eco.birth_sigma))), ckey, false, false);
 
     // footer — dev key legend when the dev panel is open, otherwise the normal controls
     let foot = if in_dev {
-        panel!(0, "1-5 mood  [ ]stage  +/-lvl", MUTED, false, true);
+        panel!(0, "1-5 mood  [ ]stage  +/-lvl  m mode", MUTED, false, true);
         " k kill · c fx · r reset · d exit "
     } else {
         " [f]eed [p]et [n]ame [g]rave [q]uit "
